@@ -74,6 +74,75 @@ def run_bg(func, callback, *args):
     threading.Thread(target=worker, daemon=True).start()
 
 
+# ------------------------------------------------------------------ log
+LOG_FILE = os.path.join(GLib.get_user_data_dir(), "ytm-popup", "player.log")
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 512 * 1024:
+            os.replace(LOG_FILE, LOG_FILE + ".old")
+        with open(LOG_FILE, "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+    except OSError:
+        pass
+
+
+class _YdlLogger:
+    """Manda avisos/erros do yt-dlp para o player.log."""
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        log("yt-dlp aviso: " + msg)
+
+    def error(self, msg):
+        log("yt-dlp erro: " + msg)
+
+
+def _short_error(err):
+    msg = str(err).replace("ERROR: ", "")
+    if "] " in msg[:40]:
+        msg = msg.split("] ", 1)[1]
+    if ": " in msg[:20]:  # remove o "videoId: " do começo
+        msg = msg.split(": ", 1)[1]
+    return msg.split(". ")[0][:140]
+
+
+def resolve_stream(video_id, cookie_file):
+    """Obtém a URL direta do áudio com yt-dlp.
+
+    Tenta primeiro com a sessão do navegador (Premium) e, se falhar,
+    sem login. Retorna dict com url, headers e se usou a conta.
+    """
+    import yt_dlp
+    page = f"https://music.youtube.com/watch?v={video_id}"
+    attempts = [cookie_file, None] if cookie_file else [None]
+    last = None
+    for cf in attempts:
+        opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": False,
+                "noplaylist": True, "logger": _YdlLogger()}
+        if cf:
+            opts["cookiefile"] = cf
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(page, download=False)
+            if info.get("url"):
+                log(f"ok {video_id} formato={info.get('format_id')} "
+                    f"conta={'sim' if cf else 'não'}")
+                return {"url": info["url"], "logged": bool(cf),
+                        "headers": info.get("http_headers") or {}}
+            last = "nenhum formato de áudio disponível"
+        except Exception as e:  # noqa: BLE001
+            last = e
+        log(f"falha {video_id} conta={'sim' if cf else 'não'}: {last}")
+    raise RuntimeError(_short_error(last))
+
+
 # ------------------------------------------------------------------ login
 LOGIN_COOKIES = {"SAPISID", "__Secure-3PAPISID"}
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
@@ -136,11 +205,14 @@ def detect_login(setting):
 # --------------------------------------------------------------------------- mpv
 class Mpv:
     """Controle do mpv via socket JSON IPC."""
-    YTDL_OPTS = "format=bestaudio/best"
-
-    def use_cookies(self, path):
-        opts = self.YTDL_OPTS + (f",cookies={path}" if path else "")
-        self.set("ytdl-raw-options", opts)
+    def load_stream(self, stream):
+        headers = dict(stream.get("headers") or {})
+        ua = headers.pop("User-Agent", None)
+        if ua:
+            self.set("user-agent", ua)
+        self.set("http-header-fields", [f"{k}: {v}" for k, v in headers.items()])
+        self.command("loadfile", stream["url"], "replace")
+        self.set("pause", False)
 
     def __init__(self, on_event, volume):
         self.on_event = on_event
@@ -151,17 +223,14 @@ class Mpv:
             os.unlink(self.sock_path)
         except OSError:
             pass
-        ytdl_opts = self.YTDL_OPTS
         cmd = [
-            "mpv", "--idle=yes", "--no-video", "--no-terminal",
+            "mpv", "--idle=yes", "--no-video", "--no-terminal", "--ytdl=no",
             "--input-ipc-server=" + self.sock_path,
-            "--ytdl-raw-options=" + ytdl_opts,
             f"--volume={volume}", "--volume-max=100",
+            "--cache=yes", "--demuxer-max-bytes=50MiB",
         ]
-        ytdlp = os.path.join(os.path.dirname(sys.executable), "yt-dlp")
-        if os.path.exists(ytdlp):
-            cmd.append("--script-opts=ytdl_hook-ytdl_path=" + ytdlp)
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         for _ in range(100):
             try:
@@ -512,28 +581,55 @@ class Popup(Gtk.ApplicationWindow):
             return
         if not self.get_visible():
             self.place_near_pointer()
-        self.show()
+        # O Marco (gerenciador de janelas do MATE) bloqueia "roubo de foco":
+        # marcamos a janela com o horário atual do servidor X para que ele
+        # entenda que ela foi aberta agora pelo usuário (via atalho).
+        self.realize()
         ts = Gtk.get_current_event_time()
+        x11 = None
         try:
             gi.require_version("GdkX11", "3.0")
             from gi.repository import GdkX11
             gw = self.get_window()
             if isinstance(gw, GdkX11.X11Window):
+                x11 = gw
                 ts = GdkX11.x11_get_server_time(gw)
+                gw.set_user_time(ts)
         except (ValueError, ImportError):
             pass
+        self.show()
         self.present_with_time(ts)
+        if x11 is not None:
+            x11.focus(ts)
         self.entry.grab_focus()
 
     # -- eventos
     def on_key(self, _w, ev):
-        if ev.keyval == Gdk.KEY_Escape:
+        k = ev.keyval
+        ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+        alt = ev.state & Gdk.ModifierType.MOD1_MASK
+        typing = self.entry.has_focus() and self.entry.get_text()
+        if k == Gdk.KEY_Escape:
             self.hide()
-            return True
-        if ev.keyval == Gdk.KEY_space and not self.entry.has_focus():
+        elif k == Gdk.KEY_space and not typing:
             self.app.toggle_pause()
-            return True
-        return False
+        elif ctrl and k == Gdk.KEY_Right or k == Gdk.KEY_AudioNext:
+            self.app.next()
+        elif ctrl and k == Gdk.KEY_Left or k == Gdk.KEY_AudioPrev:
+            self.app.prev()
+        elif alt and k == Gdk.KEY_Right:
+            self.app.seek_rel(SEEK_STEP)
+        elif alt and k == Gdk.KEY_Left:
+            self.app.seek_rel(-SEEK_STEP)
+        elif ctrl and k == Gdk.KEY_Up or k == Gdk.KEY_AudioRaiseVolume:
+            self.app.change_volume(+5)
+        elif ctrl and k == Gdk.KEY_Down or k == Gdk.KEY_AudioLowerVolume:
+            self.app.change_volume(-5)
+        elif k == Gdk.KEY_AudioPlay:
+            self.app.toggle_pause()
+        else:
+            return False
+        return True
 
     def on_focus_out(self, *_):
         if self.app.cfg.get("hide_on_focus_out"):
@@ -644,6 +740,166 @@ class Popup(Gtk.ApplicationWindow):
             self.pos_lbl.set_text(fmt_time(pos))
 
 
+MPRIS_XML = """
+<node>
+  <interface name="org.mpris.MediaPlayer2">
+    <method name="Raise"/><method name="Quit"/>
+    <property name="CanQuit" type="b" access="read"/>
+    <property name="CanRaise" type="b" access="read"/>
+    <property name="HasTrackList" type="b" access="read"/>
+    <property name="Identity" type="s" access="read"/>
+    <property name="DesktopEntry" type="s" access="read"/>
+    <property name="SupportedUriSchemes" type="as" access="read"/>
+    <property name="SupportedMimeTypes" type="as" access="read"/>
+  </interface>
+  <interface name="org.mpris.MediaPlayer2.Player">
+    <method name="Next"/><method name="Previous"/><method name="Pause"/>
+    <method name="PlayPause"/><method name="Stop"/><method name="Play"/>
+    <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+    <method name="SetPosition">
+      <arg direction="in" name="TrackId" type="o"/>
+      <arg direction="in" name="Position" type="x"/>
+    </method>
+    <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+    <signal name="Seeked"><arg name="Position" type="x"/></signal>
+    <property name="PlaybackStatus" type="s" access="read"/>
+    <property name="Rate" type="d" access="readwrite"/>
+    <property name="Metadata" type="a{sv}" access="read"/>
+    <property name="Volume" type="d" access="readwrite"/>
+    <property name="Position" type="x" access="read"/>
+    <property name="MinimumRate" type="d" access="read"/>
+    <property name="MaximumRate" type="d" access="read"/>
+    <property name="CanGoNext" type="b" access="read"/>
+    <property name="CanGoPrevious" type="b" access="read"/>
+    <property name="CanPlay" type="b" access="read"/>
+    <property name="CanPause" type="b" access="read"/>
+    <property name="CanSeek" type="b" access="read"/>
+    <property name="CanControl" type="b" access="read"/>
+  </interface>
+</node>
+"""
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+
+
+class Mpris:
+    """Expõe o player via MPRIS: teclas de mídia do teclado (Play/Pause,
+    Próxima, Anterior) e o applet de som do MATE passam a controlá-lo."""
+
+    def __init__(self, app):
+        self.app = app
+        self.conn = None
+        self.node = Gio.DBusNodeInfo.new_for_xml(MPRIS_XML)
+        self._last = {}
+        Gio.bus_own_name(Gio.BusType.SESSION, "org.mpris.MediaPlayer2.ytmpopup",
+                         Gio.BusNameOwnerFlags.NONE, self._on_bus, None, None)
+
+    def _on_bus(self, conn, _name):
+        self.conn = conn
+        for iface in self.node.interfaces:
+            reg = getattr(conn, "register_object_with_closures", None)
+            if reg is None:
+                conn.register_object(MPRIS_PATH, iface, self._call,
+                                     self._get, self._set)
+            else:
+                reg(MPRIS_PATH, iface, self._call, self._get, self._set)
+
+    # -- métodos
+    def _call(self, _conn, _sender, _path, _iface, method, params, inv):
+        a = self.app
+        if method in ("PlayPause",):
+            a.toggle_pause()
+        elif method == "Play" and a.paused:
+            a.toggle_pause()
+        elif method in ("Pause", "Stop") and not a.paused:
+            a.toggle_pause()
+        elif method == "Next":
+            a.next()
+        elif method == "Previous":
+            a.prev()
+        elif method == "Seek":
+            a.seek_rel(params.unpack()[0] / 1e6)
+        elif method == "SetPosition":
+            a.seek_abs(params.unpack()[1] / 1e6)
+        elif method == "Raise":
+            a.win.toggle() if not a.win.get_visible() else a.win.present()
+        elif method == "Quit":
+            GLib.idle_add(a.quit_all)
+        elif method == "OpenUri":
+            a.play_url(params.unpack()[0])
+        inv.return_value(None)
+
+    # -- propriedades
+    def _props(self, iface):
+        a = self.app
+        if iface == "org.mpris.MediaPlayer2":
+            return {
+                "CanQuit": GLib.Variant("b", True),
+                "CanRaise": GLib.Variant("b", True),
+                "HasTrackList": GLib.Variant("b", False),
+                "Identity": GLib.Variant("s", "YT Music Popup"),
+                "DesktopEntry": GLib.Variant("s", "ytm-popup"),
+                "SupportedUriSchemes": GLib.Variant("as", ["https"]),
+                "SupportedMimeTypes": GLib.Variant("as", []),
+            }
+        playing = a.index >= 0
+        status = "Stopped" if not playing else ("Paused" if a.paused else "Playing")
+        meta = {"mpris:trackid": GLib.Variant("o", "/org/mpris/MediaPlayer2/NoTrack")}
+        if playing:
+            t = a.queue[a.index]
+            meta = {
+                "mpris:trackid": GLib.Variant(
+                    "o", "/io/github/ytmpopup/track/" +
+                    "".join(c if c.isalnum() else "_" for c in t["videoId"])),
+                "xesam:title": GLib.Variant("s", t["title"]),
+                "xesam:artist": GLib.Variant("as", [t["artist"] or ""]),
+                "xesam:url": GLib.Variant(
+                    "s", f"https://music.youtube.com/watch?v={t['videoId']}"),
+            }
+            if a.dur:
+                meta["mpris:length"] = GLib.Variant("x", int(a.dur * 1e6))
+            if t.get("thumb"):
+                meta["mpris:artUrl"] = GLib.Variant("s", t["thumb"])
+        return {
+            "PlaybackStatus": GLib.Variant("s", status),
+            "Rate": GLib.Variant("d", 1.0),
+            "MinimumRate": GLib.Variant("d", 1.0),
+            "MaximumRate": GLib.Variant("d", 1.0),
+            "Metadata": GLib.Variant("a{sv}", meta),
+            "Volume": GLib.Variant("d", a.cfg["volume"] / 100.0),
+            "Position": GLib.Variant("x", int((a.pos or 0) * 1e6)),
+            "CanGoNext": GLib.Variant("b", True),
+            "CanGoPrevious": GLib.Variant("b", True),
+            "CanPlay": GLib.Variant("b", True),
+            "CanPause": GLib.Variant("b", True),
+            "CanSeek": GLib.Variant("b", playing),
+            "CanControl": GLib.Variant("b", True),
+        }
+
+    def _get(self, _conn, _sender, _path, iface, prop):
+        return self._props(iface).get(prop)
+
+    def _set(self, _conn, _sender, _path, _iface, prop, value):
+        if prop == "Volume":
+            v = int(max(0.0, min(1.0, value.unpack())) * 100)
+            self.app.win.volume.set_value(v)
+        return True
+
+    def changed(self):
+        if not self.conn:
+            return
+        props = self._props(MPRIS_PLAYER)
+        props.pop("Position")
+        diff = {k: v for k, v in props.items() if self._last.get(k) != v}
+        if not diff:
+            return
+        self._last.update(diff)
+        self.conn.emit_signal(
+            None, MPRIS_PATH, "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            GLib.Variant("(sa{sv}as)", (MPRIS_PLAYER, diff, [])))
+
+
 class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID,
@@ -657,11 +913,18 @@ class App(Gtk.Application):
         self.art_cache = {}
         self._pending_radio = None
         self.errors = 0
+        self.cookie_file = None
+        self.load_token = 0
+        self.stream_cache = {}  # videoId -> (instante, stream)
+        self.mpris = None
 
     # Gtk.Application garante instância única: rodar o comando de novo chega
     # aqui na instância que já está aberta.
     def do_command_line(self, cmdline):
         args = cmdline.get_arguments()[1:]
+        cmd = args[0] if args else "toggle"
+        if self.win is None and cmd not in ("toggle", "show"):
+            return 0  # player não está aberto: nada a fazer
         if self.win is None:
             self.hold()
             self.mpv = Mpv(self.on_mpv, self.cfg["volume"])
@@ -669,10 +932,15 @@ class App(Gtk.Application):
             self.refresh_login()
             # cookies do navegador mudam com o tempo: relê a cada 3 h
             GLib.timeout_add_seconds(3 * 3600, self.refresh_login)
-        cmd = args[0] if args else "toggle"
+            try:
+                self.mpris = Mpris(self)
+            except Exception as e:  # noqa: BLE001
+                log(f"MPRIS indisponível: {e}")
         actions = {"toggle": self.win.toggle, "show": self.win.toggle,
                    "play-pause": self.toggle_pause, "next": self.next,
-                   "prev": self.prev, "quit": self.quit_all}
+                   "prev": self.prev, "quit": self.quit_all,
+                   "vol-up": lambda: self.change_volume(+5),
+                   "vol-down": lambda: self.change_volume(-5)}
         actions.get(cmd, self.win.toggle)()
         return 0
 
@@ -685,7 +953,8 @@ class App(Gtk.Application):
         if err:
             login = None
         self.music.set_auth(login["headers"] if login else None)
-        self.mpv.use_cookies(login["cookie_file"] if login else None)
+        self.cookie_file = login["cookie_file"] if login else None
+        self.stream_cache.clear()
         self.win.set_account(login)
 
     # -- player
@@ -695,46 +964,98 @@ class App(Gtk.Application):
             name, data = msg.get("name"), msg.get("data")
             if name == "time-pos":
                 self.pos = data or 0
+                if self.pos >= 1:
+                    self.errors = 0  # está tocando de verdade
                 self.win.set_position(self.pos, None)
             elif name == "duration":
                 self.dur = data or 0
                 self.win.set_position(None, self.dur)
+                self.mpris_changed()
             elif name == "pause":
                 self.paused = bool(data) or self.index < 0
                 self.win.set_paused(self.paused)
+                self.mpris_changed()
             elif name == "paused-for-cache" and data:
                 self.win.set_status("Carregando…")
         elif ev == "file-loaded":
-            self.errors = 0
-            self.win.set_status("")
+            self.paused = False
             self.win.set_paused(False)
+            self.mpris_changed()
+            self._prefetch(self.index + 1)
         elif ev == "end-file":
             reason = msg.get("reason")
-            if reason == "eof":
+            if reason == "eof" and self.pos >= 2:
                 self.next()
-            elif reason == "error":
-                self.errors += 1
-                if self.errors >= 3:
-                    self.win.set_status(
-                        "O YouTube recusou a reprodução. Faça login no YouTube "
-                        "pelo Firefox (ou rode 'ytm-popup --reset').")
-                    self.win.set_paused(True)
-                    return
-                self.win.set_status("Não foi possível tocar esta faixa; pulando…")
-                GLib.timeout_add(1500, lambda: self.next() and False)
+            elif reason in ("eof", "error"):  # terminou sem tocar nada
+                self.stream_cache.pop(self._current_id(), None)
+                self._track_failed("o mpv não conseguiu reproduzir o áudio "
+                                   f"({msg.get('file_error') or reason})")
+
+    def _current_id(self):
+        if 0 <= self.index < len(self.queue):
+            return self.queue[self.index]["videoId"]
+        return None
+
+    def _cached(self, vid):
+        hit = self.stream_cache.get(vid)
+        if hit and time.time() - hit[0] < 3600:
+            return hit[1]
+        return None
+
+    def _prefetch(self, i):
+        if 0 <= i < len(self.queue):
+            vid = self.queue[i]["videoId"]
+            if not self._cached(vid):
+                def done(stream, err):
+                    if stream:
+                        self.stream_cache[vid] = (time.time(), stream)
+                run_bg(resolve_stream, done, vid, self.cookie_file)
 
     def _play_index(self, i):
         if not (0 <= i < len(self.queue)):
             return
         self.index = i
         t = self.queue[i]
+        self.pos = 0
         self.win.show_track(t)
         self.win.set_position(0, 0)
         self.win.set_status("Carregando…")
-        self.mpv.command("loadfile",
-                         f"https://music.youtube.com/watch?v={t['videoId']}",
-                         "replace")
-        self.mpv.set("pause", False)
+        self.mpris_changed()
+        self.load_token += 1
+        token, vid = self.load_token, t["videoId"]
+        self.mpv.command("stop")
+
+        def got(stream, err):
+            if token != self.load_token:
+                return  # usuário já trocou de música
+            if err:
+                self._track_failed(str(err))
+                return
+            self.stream_cache[vid] = (time.time(), stream)
+            if self.cookie_file and not stream["logged"]:
+                self.win.set_status("Tocando sem a conta (a sessão do navegador "
+                                    "falhou; veja o player.log)")
+            else:
+                self.win.set_status("")
+            self.mpv.load_stream(stream)
+
+        cached = self._cached(vid)
+        if cached:
+            got(cached, None)
+        else:
+            run_bg(resolve_stream, got, vid, self.cookie_file)
+
+    def _track_failed(self, reason):
+        self.errors += 1
+        log(f"faixa falhou ({self.errors}x seguidas): {reason}")
+        if self.errors >= 3 or self.index + 1 >= len(self.queue):
+            self.win.set_status(f"Não foi possível tocar: {reason}. "
+                                f"Detalhes em {LOG_FILE}")
+            self.win.set_paused(True)
+            return
+        self.win.set_status(f"Pulando ({reason})")
+        token = self.load_token
+        GLib.timeout_add(1500, lambda: token == self.load_token and self.next())
 
     def play_search_result(self, track):
         self.errors = 0
@@ -774,6 +1095,10 @@ class App(Gtk.Application):
             self._play_index(self.index + 1)
         return False
 
+    def change_volume(self, delta):
+        v = max(0, min(100, int(self.win.volume.get_value()) + delta))
+        self.win.volume.set_value(v)  # dispara set_volume
+
     def prev(self):
         if self.pos > 5 or self.index <= 0:
             self.seek_abs(0)
@@ -791,6 +1116,7 @@ class App(Gtk.Application):
     def set_volume(self, v):
         self.cfg["volume"] = v
         self.mpv.set("volume", v)
+        self.mpris_changed()
         GLib.timeout_add(800, self._save_cfg_once)
 
     def _save_cfg_once(self):
@@ -808,6 +1134,10 @@ class App(Gtk.Application):
                 self.art_cache[key] = pb
                 setter(pb)
         run_bg(load_pixbuf, done, url, size)
+
+    def mpris_changed(self):
+        if self.mpris:
+            self.mpris.changed()
 
     def quit_all(self):
         save_config(self.cfg)

@@ -12,31 +12,41 @@ VENV="$DATA/venv"
 READY="$DATA/.ready"
 UPDATED="$DATA/.updated"
 LOG="$DATA/setup.log"
+# Aumente quando mudar as dependências: instalações antigas são atualizadas.
+DEPS_VERSION=2
+# yt-dlp[default] inclui o yt-dlp-ejs, necessário (com o deno) para resolver
+# o desafio JavaScript do YouTube; sem ele nenhuma música toca.
+PKGS=("yt-dlp[default]" ytmusicapi deno)
 mkdir -p "$DATA"
 
 notify() { command -v notify-send >/dev/null && notify-send -i multimedia-audio-player "YT Music Popup" "$1"; }
 
 create_venv() {
-  rm -rf "$VENV"
-  python3 -m venv --system-site-packages "$VENV" &&
-  "$VENV/bin/pip" install -q --upgrade --ignore-installed yt-dlp &&
-  "$VENV/bin/pip" install -q --upgrade ytmusicapi deno &&
-  touch "$READY" "$UPDATED"
+  if [ ! -x "$VENV/bin/pip" ]; then
+    rm -rf "$VENV"
+    python3 -m venv --system-site-packages "$VENV" || return 1
+  fi
+  "$VENV/bin/pip" install -q --upgrade --ignore-installed "${PKGS[@]}" &&
+  echo "$DEPS_VERSION" > "$READY" && touch "$UPDATED"
+}
+
+is_ready() {
+  [ -x "$VENV/bin/python" ] && [ "$(cat "$READY" 2>/dev/null)" = "$DEPS_VERSION" ]
 }
 
 ensure_venv() {
-  [ -f "$READY" ] && [ -x "$VENV/bin/python" ] && return 0
+  is_ready && return 0
   if [ -n "${DISPLAY:-}" ] && command -v zenity >/dev/null; then
     ( create_venv > "$LOG" 2>&1; echo $? > "$DATA/setup.rc" ) &
     pid=$!
-    ( while kill -0 $pid 2>/dev/null; do echo "#Baixando componentes (só na primeira vez)…"; sleep 1; done ) |
+    ( while kill -0 $pid 2>/dev/null; do echo "#Baixando/atualizando componentes do player…"; sleep 1; done ) |
       zenity --progress --pulsate --auto-close --no-cancel \
              --title="YT Music Popup" --text="Preparando…" 2>/dev/null
     wait $pid
   else
     create_venv > "$LOG" 2>&1
   fi
-  if [ ! -f "$READY" ]; then
+  if ! is_ready; then
     msg="Falha ao preparar o ytm-popup (sem internet?). Detalhes: $LOG"
     command -v zenity >/dev/null && [ -n "${DISPLAY:-}" ] && zenity --error --text="$msg" 2>/dev/null || echo "$msg" >&2
     exit 1
@@ -46,18 +56,17 @@ ensure_venv() {
 weekly_update() {
   if [ -z "$(find "$UPDATED" -mtime -7 2>/dev/null)" ]; then
     touch "$UPDATED"
-    ( nice "$VENV/bin/pip" install -q -U --ignore-installed yt-dlp &&
-      nice "$VENV/bin/pip" install -q -U ytmusicapi ) >/dev/null 2>&1 &
+    nice "$VENV/bin/pip" install -q -U "${PKGS[@]}" >/dev/null 2>&1 &
   fi
 }
 
 case "${1:-}" in
   --setup)   # usado pelo autostart no login: atalho + ambiente, sem abrir a janela
     "$LIB/ytm-popup-shortcut" --first-run
-    [ -f "$READY" ] || { create_venv > "$LOG" 2>&1 && notify "Pronto! Use Super+M para abrir o player."; }
+    is_ready || { create_venv > "$LOG" 2>&1 && notify "Pronto! Use Super+M para abrir o player."; }
     exit 0 ;;
   --reset)
-    rm -rf "$VENV" "$READY"; echo "Ambiente removido; será recriado na próxima execução."; exit 0 ;;
+    rm -rf "$VENV" "$READY" "${XDG_CONFIG_HOME:-$HOME/.config}/ytm-popup/.shortcuts-v2"; echo "Ambiente removido; será recriado na próxima execução."; exit 0 ;;
 esac
 
 "$LIB/ytm-popup-shortcut" --first-run

@@ -1,43 +1,69 @@
 #!/usr/bin/env bash
-# Configura o atalho de teclado do MATE para o ytm-popup.
-#   ytm-popup-shortcut                  -> Super+M
-#   ytm-popup-shortcut '<Primary><Alt>m' -> Ctrl+Alt+M
-#   ytm-popup-shortcut --remove         -> remove o atalho
-#   ytm-popup-shortcut --first-run      -> só configura se nunca foi feito
+# Configura os atalhos de teclado globais do MATE para o ytm-popup.
+#   ytm-popup-shortcut                   -> configura todos (padrões abaixo)
+#   ytm-popup-shortcut '<Primary><Alt>m' -> muda só o atalho de abrir/fechar
+#   ytm-popup-shortcut --remove          -> remove todos
+#   ytm-popup-shortcut --list            -> mostra os atalhos atuais
+#   ytm-popup-shortcut --first-run       -> configura só o que ainda não existe
 set -u
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/ytm-popup"
-STAMP="$CONF/.shortcut-done"
+STAMP="$CONF/.shortcuts-v2"
 BASE=/org/mate/desktop/keybindings
 command -v dconf >/dev/null || { echo "dconf não encontrado" >&2; exit 1; }
 
+# nome | comando | atalho padrão
+DEFAULTS=(
+  "YT Music Popup|ytm-popup|<Mod4>m"
+  "YT Music: próxima|ytm-popup next|<Mod4><Alt>Right"
+  "YT Music: anterior|ytm-popup prev|<Mod4><Alt>Left"
+  "YT Music: tocar/pausar|ytm-popup play-pause|<Mod4><Alt>space"
+  "YT Music: volume +|ytm-popup vol-up|<Mod4><Alt>Up"
+  "YT Music: volume -|ytm-popup vol-down|<Mod4><Alt>Down"
+)
+
+# slot cujo comando é exatamente $1 (ou o primeiro livre)
 find_slot() {
-  local free=""
-  for i in $(seq 0 99); do
-    local p="$BASE/custom$i/" a
+  local free="" i p a
+  for i in $(seq 0 199); do
+    p="$BASE/custom$i/"
     a="$(dconf read "${p}action" 2>/dev/null)"
-    if [[ "$a" == *ytm-popup* ]]; then echo "$p"; return; fi
+    if [[ "$a" == "'$1'" ]]; then echo "$p"; return; fi
     [[ -z "$free" && -z "$a" ]] && free="$p"
   done
   echo "$free"
 }
 
+set_binding() {  # nome comando atalho [só_se_não_existir]
+  local slot
+  slot="$(find_slot "$2")"
+  [ -n "$slot" ] || { echo "Sem espaço para atalhos personalizados" >&2; return 1; }
+  if [ "${4:-}" = keep ] && [ -n "$(dconf read "${slot}action")" ]; then return 0; fi
+  dconf write "${slot}name" "'$1'"
+  dconf write "${slot}action" "'$2'"
+  dconf write "${slot}binding" "'$3'"
+}
+
 case "${1:-}" in
   --first-run)
     [ -f "$STAMP" ] && exit 0
-    set -- "<Mod4>m" ;;
+    for d in "${DEFAULTS[@]}"; do IFS='|' read -r n c b <<<"$d"; set_binding "$n" "$c" "$b" keep; done
+    mkdir -p "$CONF"; touch "$STAMP"; exit 0 ;;
   --remove)
-    for i in $(seq 0 99); do
+    for i in $(seq 0 199); do
       p="$BASE/custom$i/"
       [[ "$(dconf read "${p}action" 2>/dev/null)" == *ytm-popup* ]] && dconf reset -f "$p"
     done
-    rm -f "$STAMP"; echo "Atalho removido."; exit 0 ;;
+    rm -f "$STAMP" "$CONF/.shortcut-done"; echo "Atalhos removidos."; exit 0 ;;
+  --list)
+    for i in $(seq 0 199); do
+      p="$BASE/custom$i/"
+      a="$(dconf read "${p}action" 2>/dev/null)"
+      [[ "$a" == *ytm-popup* ]] && echo "$(dconf read "${p}binding")  ->  $a"
+    done
+    exit 0 ;;
+  "")
+    for d in "${DEFAULTS[@]}"; do IFS='|' read -r n c b <<<"$d"; set_binding "$n" "$c" "$b"; done
+    mkdir -p "$CONF"; touch "$STAMP"; "$0" --list ;;
+  *)
+    set_binding "YT Music Popup" "ytm-popup" "$1" && echo "Atalho de abrir/fechar: $1" ;;
 esac
-
-BINDING="${1:-<Mod4>m}"
-slot="$(find_slot)"
-[ -n "$slot" ] || { echo "Sem espaço para atalhos personalizados" >&2; exit 1; }
-dconf write "${slot}name" "'YT Music Popup'"
-dconf write "${slot}action" "'ytm-popup'"
-dconf write "${slot}binding" "'$BINDING'"
-mkdir -p "$CONF"; touch "$STAMP"
-echo "Atalho configurado: $BINDING"
