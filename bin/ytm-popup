@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Launcher do ytm-popup.
+# - Na primeira execução cria um ambiente Python do usuário com yt-dlp,
+#   ytmusicapi e deno (que não existem/ficam desatualizados no apt).
+# - Uma vez por semana atualiza o yt-dlp em segundo plano.
+# - Registra o atalho de teclado do MATE na primeira vez.
+set -u
+
+LIB="${YTM_POPUP_LIB:-/usr/share/ytm-popup}"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/ytm-popup"
+VENV="$DATA/venv"
+READY="$DATA/.ready"
+UPDATED="$DATA/.updated"
+LOG="$DATA/setup.log"
+mkdir -p "$DATA"
+
+notify() { command -v notify-send >/dev/null && notify-send -i multimedia-audio-player "YT Music Popup" "$1"; }
+
+create_venv() {
+  rm -rf "$VENV"
+  python3 -m venv --system-site-packages "$VENV" &&
+  "$VENV/bin/pip" install -q --upgrade --ignore-installed yt-dlp &&
+  "$VENV/bin/pip" install -q --upgrade ytmusicapi deno &&
+  touch "$READY" "$UPDATED"
+}
+
+ensure_venv() {
+  [ -f "$READY" ] && [ -x "$VENV/bin/python" ] && return 0
+  if [ -n "${DISPLAY:-}" ] && command -v zenity >/dev/null; then
+    ( create_venv > "$LOG" 2>&1; echo $? > "$DATA/setup.rc" ) &
+    pid=$!
+    ( while kill -0 $pid 2>/dev/null; do echo "#Baixando componentes (só na primeira vez)…"; sleep 1; done ) |
+      zenity --progress --pulsate --auto-close --no-cancel \
+             --title="YT Music Popup" --text="Preparando…" 2>/dev/null
+    wait $pid
+  else
+    create_venv > "$LOG" 2>&1
+  fi
+  if [ ! -f "$READY" ]; then
+    msg="Falha ao preparar o ytm-popup (sem internet?). Detalhes: $LOG"
+    command -v zenity >/dev/null && [ -n "${DISPLAY:-}" ] && zenity --error --text="$msg" 2>/dev/null || echo "$msg" >&2
+    exit 1
+  fi
+}
+
+weekly_update() {
+  if [ -z "$(find "$UPDATED" -mtime -7 2>/dev/null)" ]; then
+    touch "$UPDATED"
+    ( nice "$VENV/bin/pip" install -q -U --ignore-installed yt-dlp &&
+      nice "$VENV/bin/pip" install -q -U ytmusicapi ) >/dev/null 2>&1 &
+  fi
+}
+
+case "${1:-}" in
+  --setup)   # usado pelo autostart no login: atalho + ambiente, sem abrir a janela
+    "$LIB/ytm-popup-shortcut" --first-run
+    [ -f "$READY" ] || { create_venv > "$LOG" 2>&1 && notify "Pronto! Use Super+M para abrir o player."; }
+    exit 0 ;;
+  --reset)
+    rm -rf "$VENV" "$READY"; echo "Ambiente removido; será recriado na próxima execução."; exit 0 ;;
+esac
+
+"$LIB/ytm-popup-shortcut" --first-run
+ensure_venv
+weekly_update
+export PATH="$VENV/bin:$PATH"
+exec "$VENV/bin/python" "$LIB/ytm_popup.py" "$@"

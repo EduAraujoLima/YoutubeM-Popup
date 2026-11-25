@@ -1,0 +1,33 @@
+name: Build .deb
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          python3 -m py_compile src/ytm_popup.py
+          bash -n bin/ytm-popup bin/ytm-popup-shortcut
+          VERSION="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || VERSION="$(cat VERSION)"
+          packaging/build-deb.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.deb --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" dist/*.deb --clobber

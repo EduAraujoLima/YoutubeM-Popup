@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=YT Music Popup
+GenericName=Mini player de música
+Comment=Mini player do YouTube Music sem login (atalho: Super+M)
+Exec=ytm-popup
+Icon=multimedia-audio-player
+Categories=AudioVideo;Audio;Player;
+Keywords=youtube;music;player;
+Terminal=false
+StartupNotify=false

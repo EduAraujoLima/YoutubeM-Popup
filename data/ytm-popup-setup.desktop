@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=YT Music Popup (configuração inicial)
+Comment=Registra o atalho e prepara os componentes do ytm-popup
+Exec=ytm-popup --setup
+Icon=multimedia-audio-player
+NoDisplay=true
+OnlyShowIn=MATE;
+X-MATE-Autostart-enabled=true
