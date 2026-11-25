@@ -117,53 +117,70 @@ def _short_error(err):
 class Resolver:
     """Obtém a URL direta do áudio com yt-dlp.
 
-    As instâncias do yt-dlp são persistentes (uma por "pista": fg para o
-    clique do usuário, bg0..bg2 para pré-carregamento), reaproveitando o
-    player JavaScript já baixado, conexões HTTP e cookies entre faixas.
-    Tenta primeiro com a sessão do navegador (Premium) e, se falhar, sem
-    login.
+    Mantém um pool de instâncias persistentes do yt-dlp (reaproveitam o
+    player JavaScript já baixado, conexões HTTP e cookies). Cada pedido
+    pega uma instância livre, então um pedido novo nunca espera na fila
+    atrás de faixas que o usuário já pulou. Tenta primeiro com a sessão do
+    navegador (Premium) e, se falhar, sem login.
     """
+    MAX_IDLE = 4
 
     def __init__(self):
-        self._pool = {}  # (pista, arquivo_de_cookies) -> (lock, YoutubeDL)
+        self._idle = {}  # arquivo_de_cookies -> [YoutubeDL livres]
         self._guard = threading.Lock()
+        self._generation = 0
+
+    @staticmethod
+    def _new(cookie_file):
+        import yt_dlp
+        opts = {"format": "bestaudio/best", "quiet": True,
+                "no_warnings": False, "noplaylist": True,
+                "logger": _YdlLogger()}
+        if cookie_file:
+            opts["cookiefile"] = cookie_file
+        return yt_dlp.YoutubeDL(opts)
 
     def warm(self):
         """Importa o yt-dlp antecipadamente (leva 1-2 s na 1ª vez)."""
         t = time.time()
-        self._get("fg", None)
+        ydl = self._new(None)
+        self._release(None, ydl, self._generation)
         log(f"yt-dlp pré-carregado em {time.time() - t:.1f}s")
 
     def reset(self):
         with self._guard:
-            self._pool.clear()
+            self._generation += 1
+            self._idle.clear()
 
-    def _get(self, lane, cookie_file):
-        import yt_dlp
+    def _acquire(self, cookie_file):
         with self._guard:
-            key = (lane, cookie_file)
-            if key not in self._pool:
-                opts = {"format": "bestaudio/best", "quiet": True,
-                        "no_warnings": False, "noplaylist": True,
-                        "logger": _YdlLogger()}
-                if cookie_file:
-                    opts["cookiefile"] = cookie_file
-                self._pool[key] = (threading.Lock(), yt_dlp.YoutubeDL(opts))
-            return self._pool[key]
+            gen = self._generation
+            free = self._idle.get(cookie_file)
+            if free:
+                return free.pop(), gen
+        return self._new(cookie_file), gen
 
-    def resolve(self, video_id, cookie_file, lane="fg"):
+    def _release(self, cookie_file, ydl, gen):
+        with self._guard:
+            free = self._idle.setdefault(cookie_file, [])
+            if gen == self._generation and len(free) < self.MAX_IDLE:
+                free.append(ydl)
+
+    def resolve(self, video_id, cookie_file):
         page = f"https://music.youtube.com/watch?v={video_id}"
         attempts = [cookie_file, None] if cookie_file else [None]
         last = None
         for cf in attempts:
             t = time.time()
             try:
-                lock, ydl = self._get(lane, cf)
-                with lock:
+                ydl, gen = self._acquire(cf)
+                try:
                     info = ydl.extract_info(page, download=False)
+                finally:
+                    self._release(cf, ydl, gen)
                 if info.get("url"):
                     m = re.search(r"[?&]expire=(\d+)", info["url"])
-                    log(f"ok {video_id} em {time.time() - t:.1f}s ({lane}) "
+                    log(f"ok {video_id} em {time.time() - t:.1f}s "
                         f"formato={info.get('format_id')} "
                         f"conta={'sim' if cf else 'não'}")
                     return {"url": info["url"], "logged": bool(cf),
@@ -560,6 +577,12 @@ class Popup(Gtk.ApplicationWindow):
         self.entry = Gtk.SearchEntry()
         self.entry.set_placeholder_text("Pesquisar música, artista ou link…")
         self.entry.connect("activate", self.on_search)
+        self.entry.connect("changed", self.on_changed)
+        self._search_timer = None
+        self._prefetch_timer = None
+        self._search_busy = False
+        self._search_pending = None
+        self._shown_query = None
         root.pack_start(self.entry, False, False, 0)
 
         self.status = Gtk.Label(xalign=0)
@@ -684,15 +707,73 @@ class Popup(Gtk.ApplicationWindow):
         self.vol_icon.set_from_icon_name(f"audio-volume-{name}-symbolic",
                                          Gtk.IconSize.MENU)
 
+    @staticmethod
+    def _is_url(q):
+        return q.startswith("http://") or q.startswith("https://")
+
+    def _cancel_timer(self, name):
+        tid = getattr(self, name)
+        if tid:
+            GLib.source_remove(tid)
+            setattr(self, name, None)
+
+    def on_changed(self, entry):
+        """Busca enquanto digita (debounce de 300 ms)."""
+        self._cancel_timer("_search_timer")
+        q = entry.get_text().strip()
+        if not q:
+            self._search_pending = None
+            self._shown_query = None
+            self.scroll.hide()
+            self.set_status("")
+            self.resize(360, 1)
+            return
+        if self._is_url(q) or len(q) < 2:
+            return
+
+        def fire():
+            self._search_timer = None
+            self._run_search(q)
+            return False
+        self._search_timer = GLib.timeout_add(300, fire)
+
     def on_search(self, entry):
+        """Enter: toca o 1º resultado (se já exibido) ou busca na hora."""
+        self._cancel_timer("_search_timer")
         q = entry.get_text().strip()
         if not q:
             return
-        if q.startswith("http://") or q.startswith("https://"):
+        if self._is_url(q):
             self.app.play_url(q)
             return
-        self.set_status("Pesquisando…")
-        run_bg(self.app.music.search, self.show_results, q)
+        rows = self.results.get_children()
+        if q == self._shown_query and rows and self.scroll.get_visible():
+            self.on_result(self.results, rows[0])
+            return
+        self._run_search(q)
+
+    def _run_search(self, q):
+        # só uma busca por vez; se o usuário continuou digitando, a mais
+        # recente roda em seguida e as intermediárias são descartadas
+        if self._search_busy:
+            self._search_pending = q
+            return
+        self._search_busy = True
+        if not self.scroll.get_visible():
+            self.set_status("Pesquisando…")
+
+        def done(tracks, err):
+            self._search_busy = False
+            pending, self._search_pending = self._search_pending, None
+            current = self.entry.get_text().strip()
+            if pending and pending != q and pending == current:
+                self._run_search(pending)
+                return
+            if q != current:
+                return  # resposta velha: o texto já mudou
+            self._shown_query = q
+            self.show_results(tracks, err)
+        run_bg(self.app.music.search, done, q)
 
     def show_results(self, tracks, err):
         for child in self.results.get_children():
@@ -731,8 +812,15 @@ class Popup(Gtk.ApplicationWindow):
                 self.app.load_art(t["thumb"], 36, img.set_from_pixbuf)
         self.results.show_all()
         self.scroll.show()
-        # pré-carrega as primeiras: ao clicar, toca na hora
-        self.app.prefetch([t["videoId"] for t in tracks[:3]])
+        # pré-carrega as primeiras quando o usuário para de digitar
+        self._cancel_timer("_prefetch_timer")
+        ids = [t["videoId"] for t in tracks[:3]]
+
+        def prefetch():
+            self._prefetch_timer = None
+            self.app.prefetch(ids)
+            return False
+        self._prefetch_timer = GLib.timeout_add(700, prefetch)
         GLib.idle_add(self.keep_on_screen)
 
     def keep_on_screen(self):
@@ -952,6 +1040,7 @@ class App(Gtk.Application):
         self.load_token = 0
         self.stream_cache = {}  # videoId -> stream
         self.inflight = {}  # videoId -> callbacks aguardando a URL
+        self.bg_running = 0  # pré-carregamentos em andamento
         self.resolver = Resolver()
         self.needs_load = False
         self.mpris = None
@@ -1033,7 +1122,7 @@ class App(Gtk.Application):
             self.paused = False
             self.win.set_paused(False)
             self.mpris_changed()
-            self._prefetch(self.index + 1)
+            self._prefetch_ahead()
         elif ev == "end-file":
             reason = msg.get("reason")
             if reason == "eof" and self.pos >= 2:
@@ -1054,7 +1143,7 @@ class App(Gtk.Application):
             return hit
         return None
 
-    def resolve_async(self, vid, callback, lane="fg"):
+    def resolve_async(self, vid, callback, background=False):
         """Resolve a URL do áudio; reaproveita cache e pedidos em andamento."""
         cached = self._cached(vid)
         if cached:
@@ -1063,22 +1152,29 @@ class App(Gtk.Application):
         if vid in self.inflight:  # já está sendo pré-carregada: espera ela
             self.inflight[vid].append(callback)
             return
+        if background and self.bg_running >= 3:
+            return  # não sobrecarrega o YouTube com pré-carregamentos
         self.inflight[vid] = [callback]
+        if background:
+            self.bg_running += 1
 
         def done(stream, err):
+            if background:
+                self.bg_running -= 1
             if stream:
                 self.stream_cache[vid] = stream
             for cb in self.inflight.pop(vid, []):
                 cb(stream, err)
-        run_bg(self.resolver.resolve, done, vid, self.cookie_file, lane)
+        run_bg(self.resolver.resolve, done, vid, self.cookie_file)
 
     def prefetch(self, vids):
-        for n, vid in enumerate(vids[:3]):
-            self.resolve_async(vid, lambda *_: None, f"bg{n}")
+        for vid in vids[:3]:
+            self.resolve_async(vid, lambda *_: None, background=True)
 
-    def _prefetch(self, i):
-        if 0 <= i < len(self.queue):
-            self.prefetch([self.queue[i]["videoId"]])
+    def _prefetch_ahead(self, n=2):
+        """Deixa as próximas n faixas da fila prontas."""
+        nxt = self.queue[self.index + 1:self.index + 1 + n]
+        self.prefetch([t["videoId"] for t in nxt])
 
     def _play_index(self, i):
         if not (0 <= i < len(self.queue)):
@@ -1110,7 +1206,8 @@ class App(Gtk.Application):
                 self.win.set_status("")
             self.mpv.load_stream(stream)
 
-        self.resolve_async(vid, got, "fg")
+        self.resolve_async(vid, got)
+        self._prefetch_ahead()
 
     def _track_failed(self, reason):
         self.errors += 1
@@ -1138,6 +1235,7 @@ class App(Gtk.Application):
             return  # o usuário já escolheu outra música
         first = self.queue[0]
         self.queue = [first] + [t for t in tracks if t["videoId"] != first["videoId"]]
+        self._prefetch_ahead()
 
     def play_url(self, url):
         vid = None

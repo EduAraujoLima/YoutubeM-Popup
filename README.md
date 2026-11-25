@@ -8,9 +8,10 @@ atalho de teclado (**Super+M**).
 - Capa do álbum, título/artista e barra de progresso clicável
 - Anterior · voltar 10s · tocar/pausar · avançar 10s · próxima
 - Volume (lembrado entre sessões)
-- Busca simples (Enter) — também aceita colar um link do YouTube
+- Busca enquanto você digita (sem precisar de Enter); Enter toca o 1º
+  resultado. Também aceita colar um link do YouTube
 - Fila automática ("rádio") a partir da música escolhida
-- Início rápido: os primeiros resultados da busca e a próxima faixa são
+- Início rápido: os primeiros resultados da busca e as 2 próximas faixas são
   pré-carregados em segundo plano, então a música começa assim que você clica;
   a última música tocada fica pronta para continuar quando o player abre
 - **Sem digitar login:** se você estiver logado no YouTube no **Firefox**, o
