@@ -10,6 +10,9 @@ atalho de teclado (**Super+M**).
 - Volume (lembrado entre sessões)
 - Busca simples (Enter) — também aceita colar um link do YouTube
 - Fila automática ("rádio") a partir da música escolhida
+- Início rápido: os primeiros resultados da busca e a próxima faixa são
+  pré-carregados em segundo plano, então a música começa assim que você clica;
+  a última música tocada fica pronta para continuar quando o player abre
 - **Sem digitar login:** se você estiver logado no YouTube no **Firefox**, o
   player usa essa sessão automaticamente (YouTube Premium: áudio em qualidade
   Premium, recomendações da sua conta). Sem login, funciona em modo anônimo.

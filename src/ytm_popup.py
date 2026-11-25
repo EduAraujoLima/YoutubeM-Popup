@@ -6,6 +6,7 @@ Executar de novo o comando alterna (mostra/esconde) a janela: é isso que o
 atalho de teclado faz. A música continua tocando com a janela escondida.
 """
 import json
+import re
 import os
 import socket
 import subprocess
@@ -113,34 +114,66 @@ def _short_error(err):
     return msg.split(". ")[0][:140]
 
 
-def resolve_stream(video_id, cookie_file):
+class Resolver:
     """Obtém a URL direta do áudio com yt-dlp.
 
-    Tenta primeiro com a sessão do navegador (Premium) e, se falhar,
-    sem login. Retorna dict com url, headers e se usou a conta.
+    As instâncias do yt-dlp são persistentes (uma por "pista": fg para o
+    clique do usuário, bg0..bg2 para pré-carregamento), reaproveitando o
+    player JavaScript já baixado, conexões HTTP e cookies entre faixas.
+    Tenta primeiro com a sessão do navegador (Premium) e, se falhar, sem
+    login.
     """
-    import yt_dlp
-    page = f"https://music.youtube.com/watch?v={video_id}"
-    attempts = [cookie_file, None] if cookie_file else [None]
-    last = None
-    for cf in attempts:
-        opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": False,
-                "noplaylist": True, "logger": _YdlLogger()}
-        if cf:
-            opts["cookiefile"] = cf
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(page, download=False)
-            if info.get("url"):
-                log(f"ok {video_id} formato={info.get('format_id')} "
-                    f"conta={'sim' if cf else 'não'}")
-                return {"url": info["url"], "logged": bool(cf),
-                        "headers": info.get("http_headers") or {}}
-            last = "nenhum formato de áudio disponível"
-        except Exception as e:  # noqa: BLE001
-            last = e
-        log(f"falha {video_id} conta={'sim' if cf else 'não'}: {last}")
-    raise RuntimeError(_short_error(last))
+
+    def __init__(self):
+        self._pool = {}  # (pista, arquivo_de_cookies) -> (lock, YoutubeDL)
+        self._guard = threading.Lock()
+
+    def warm(self):
+        """Importa o yt-dlp antecipadamente (leva 1-2 s na 1ª vez)."""
+        t = time.time()
+        self._get("fg", None)
+        log(f"yt-dlp pré-carregado em {time.time() - t:.1f}s")
+
+    def reset(self):
+        with self._guard:
+            self._pool.clear()
+
+    def _get(self, lane, cookie_file):
+        import yt_dlp
+        with self._guard:
+            key = (lane, cookie_file)
+            if key not in self._pool:
+                opts = {"format": "bestaudio/best", "quiet": True,
+                        "no_warnings": False, "noplaylist": True,
+                        "logger": _YdlLogger()}
+                if cookie_file:
+                    opts["cookiefile"] = cookie_file
+                self._pool[key] = (threading.Lock(), yt_dlp.YoutubeDL(opts))
+            return self._pool[key]
+
+    def resolve(self, video_id, cookie_file, lane="fg"):
+        page = f"https://music.youtube.com/watch?v={video_id}"
+        attempts = [cookie_file, None] if cookie_file else [None]
+        last = None
+        for cf in attempts:
+            t = time.time()
+            try:
+                lock, ydl = self._get(lane, cf)
+                with lock:
+                    info = ydl.extract_info(page, download=False)
+                if info.get("url"):
+                    m = re.search(r"[?&]expire=(\d+)", info["url"])
+                    log(f"ok {video_id} em {time.time() - t:.1f}s ({lane}) "
+                        f"formato={info.get('format_id')} "
+                        f"conta={'sim' if cf else 'não'}")
+                    return {"url": info["url"], "logged": bool(cf),
+                            "headers": info.get("http_headers") or {},
+                            "expires": int(m.group(1)) if m else time.time() + 3600}
+                last = "nenhum formato de áudio disponível"
+            except Exception as e:  # noqa: BLE001
+                last = e
+            log(f"falha {video_id} conta={'sim' if cf else 'não'}: {last}")
+        raise RuntimeError(_short_error(last))
 
 
 # ------------------------------------------------------------------ login
@@ -698,6 +731,8 @@ class Popup(Gtk.ApplicationWindow):
                 self.app.load_art(t["thumb"], 36, img.set_from_pixbuf)
         self.results.show_all()
         self.scroll.show()
+        # pré-carrega as primeiras: ao clicar, toca na hora
+        self.app.prefetch([t["videoId"] for t in tracks[:3]])
         GLib.idle_add(self.keep_on_screen)
 
     def keep_on_screen(self):
@@ -915,7 +950,10 @@ class App(Gtk.Application):
         self.errors = 0
         self.cookie_file = None
         self.load_token = 0
-        self.stream_cache = {}  # videoId -> (instante, stream)
+        self.stream_cache = {}  # videoId -> stream
+        self.inflight = {}  # videoId -> callbacks aguardando a URL
+        self.resolver = Resolver()
+        self.needs_load = False
         self.mpris = None
 
     # Gtk.Application garante instância única: rodar o comando de novo chega
@@ -929,6 +967,8 @@ class App(Gtk.Application):
             self.hold()
             self.mpv = Mpv(self.on_mpv, self.cfg["volume"])
             self.win = Popup(self)
+            run_bg(self.resolver.warm, lambda *_: None)
+            self._restore_last_track()
             self.refresh_login()
             # cookies do navegador mudam com o tempo: relê a cada 3 h
             GLib.timeout_add_seconds(3 * 3600, self.refresh_login)
@@ -954,8 +994,20 @@ class App(Gtk.Application):
             login = None
         self.music.set_auth(login["headers"] if login else None)
         self.cookie_file = login["cookie_file"] if login else None
+        self.resolver.reset()  # recarrega cookies novos
         self.stream_cache.clear()
         self.win.set_account(login)
+        # deixa a faixa atual/última pronta (aquece também o deno e o cache
+        # do player do YouTube, acelerando as próximas)
+        if self.queue:
+            self.prefetch([self.queue[max(self.index, 0)]["videoId"]])
+
+    def _restore_last_track(self):
+        t = self.cfg.get("last_track")
+        if t and t.get("videoId"):
+            self.queue, self.index, self.needs_load = [t], 0, True
+            self.win.show_track(t)
+            self.win.set_status("Aperte ▶ para continuar")
 
     # -- player
     def on_mpv(self, msg):
@@ -998,18 +1050,35 @@ class App(Gtk.Application):
 
     def _cached(self, vid):
         hit = self.stream_cache.get(vid)
-        if hit and time.time() - hit[0] < 3600:
-            return hit[1]
+        if hit and hit["expires"] - time.time() > 600:
+            return hit
         return None
+
+    def resolve_async(self, vid, callback, lane="fg"):
+        """Resolve a URL do áudio; reaproveita cache e pedidos em andamento."""
+        cached = self._cached(vid)
+        if cached:
+            callback(cached, None)
+            return
+        if vid in self.inflight:  # já está sendo pré-carregada: espera ela
+            self.inflight[vid].append(callback)
+            return
+        self.inflight[vid] = [callback]
+
+        def done(stream, err):
+            if stream:
+                self.stream_cache[vid] = stream
+            for cb in self.inflight.pop(vid, []):
+                cb(stream, err)
+        run_bg(self.resolver.resolve, done, vid, self.cookie_file, lane)
+
+    def prefetch(self, vids):
+        for n, vid in enumerate(vids[:3]):
+            self.resolve_async(vid, lambda *_: None, f"bg{n}")
 
     def _prefetch(self, i):
         if 0 <= i < len(self.queue):
-            vid = self.queue[i]["videoId"]
-            if not self._cached(vid):
-                def done(stream, err):
-                    if stream:
-                        self.stream_cache[vid] = (time.time(), stream)
-                run_bg(resolve_stream, done, vid, self.cookie_file)
+            self.prefetch([self.queue[i]["videoId"]])
 
     def _play_index(self, i):
         if not (0 <= i < len(self.queue)):
@@ -1023,7 +1092,10 @@ class App(Gtk.Application):
         self.mpris_changed()
         self.load_token += 1
         token, vid = self.load_token, t["videoId"]
+        self.needs_load = False
         self.mpv.command("stop")
+        self.cfg["last_track"] = t
+        GLib.timeout_add(800, self._save_cfg_once)
 
         def got(stream, err):
             if token != self.load_token:
@@ -1031,7 +1103,6 @@ class App(Gtk.Application):
             if err:
                 self._track_failed(str(err))
                 return
-            self.stream_cache[vid] = (time.time(), stream)
             if self.cookie_file and not stream["logged"]:
                 self.win.set_status("Tocando sem a conta (a sessão do navegador "
                                     "falhou; veja o player.log)")
@@ -1039,11 +1110,7 @@ class App(Gtk.Application):
                 self.win.set_status("")
             self.mpv.load_stream(stream)
 
-        cached = self._cached(vid)
-        if cached:
-            got(cached, None)
-        else:
-            run_bg(resolve_stream, got, vid, self.cookie_file)
+        self.resolve_async(vid, got, "fg")
 
     def _track_failed(self, reason):
         self.errors += 1
@@ -1087,6 +1154,9 @@ class App(Gtk.Application):
             self.win.set_status("Link não reconhecido.")
 
     def toggle_pause(self):
+        if self.needs_load:  # última música da sessão anterior
+            self.play_search_result(self.queue[self.index])
+            return
         if self.index >= 0:
             self.mpv.command("cycle", "pause")
 
